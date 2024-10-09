@@ -76,3 +76,13 @@ class ElementWiseAdam(Optimizer):
                 param.data.add_(-step_size * update * filters[idx])
 
         return loss
+    
+    # Load state_dict from PyTorch Adam
+    def load_state_dict(self, state_dict, filters=None):
+        # Load state dictionary into CustomAdam
+        super(ElementWiseAdam, self).load_state_dict(state_dict)
+        
+        # Update filters if provided
+        if filters is not None:
+            for group in self.param_groups:
+                group['filters'] = filters
