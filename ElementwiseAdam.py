@@ -3,9 +3,6 @@ import torch
 
 class ElementWiseAdam(Optimizer):
     """
-    A custom implementation of the Adam optimizer. Defaults used are as recommended in https://arxiv.org/abs/1412.6980 
-    See the paper or visit Optimizer_Experimentation.ipynb for more information on how exactly Adam works + mathematics behind it.
-
     Params:
     lr (float): Learing rate for parameter update
     betas (Tuple[float, float]): coefficients used for calculating momentum of gradients
@@ -34,48 +31,79 @@ class ElementWiseAdam(Optimizer):
 
         for group in self.param_groups:
             filters = group['filters']
-            for idx, param in enumerate(group['params']):
-                if param.grad is None:
-                    continue
+            params = group['params']
+            betas = group['betas']
+            eps = group['eps']
+            lr = group['lr']
+            bias_correction = group.get('bias_correction', True)
 
-                gradients = param.grad.data
+            exp_avgs = []
+            exp_avg_sqs = []
+            state_steps = []
+            grads = []
+            filtered_params = []
+
+            for idx, p in enumerate(params):
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                state = self.state[p]
 
                 # State initialization
-                state = self.state[param]
                 if len(state) == 0:
                     state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(param.data)
-                    state['exp_avg_sq'] = torch.zeros_like(param.data)
+                    # Exponential moving average of gradient values
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    # Exponential moving average of squared gradient values
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
 
-                exp_avg = state['exp_avg']
-                exp_avg_sq = state['exp_avg_sq']
-
-                # Increment step
+                # Increment state step
                 state['step'] += 1
 
-                # Update biased first moment estimate
-                exp_avg.mul_(group['betas'][0]).add_(gradients, alpha=(1.0 - group['betas'][0]))
+                exp_avgs.append(state['exp_avg'])
+                exp_avg_sqs.append(state['exp_avg_sq'])
+                state_steps.append(state['step'])
+                grads.append(grad)
+                filtered_params.append((p, filters[idx]))
 
-                # Update biased second raw moment estimate
-                exp_avg_sq.mul_(group['betas'][1]).addcmul_(gradients, gradients, value=(1.0 - group['betas'][1]))
+            if not grads:
+                continue
 
-                # Compute bias-corrected first moment estimate
-                if group['bias_correction']:
-                    bias_correction1 = 1 - group['betas'][0] ** state['step']
-                    bias_correction2 = 1 - group['betas'][1] ** state['step']
-                    first_unbiased = exp_avg / bias_correction1
-                    second_unbiased = exp_avg_sq / bias_correction2
-                else:
-                    first_unbiased = exp_avg
-                    second_unbiased = exp_avg_sq
+            # Convert lists to tuples for foreach functions
+            exp_avgs = tuple(exp_avgs)
+            exp_avg_sqs = tuple(exp_avg_sqs)
+            grads = tuple(grads)
+            # Note: state_steps remains a list because we don't need it to be a tuple
 
-                # Update parameters with filter applied
-                denom = second_unbiased.sqrt().add_(group['eps'])
-                step_size = group['lr']
-                update = first_unbiased / denom
-                param.data.add_(-step_size * update * filters[idx])
+            beta1, beta2 = betas
+
+            # Decay the first and second moment running average coefficient
+            torch._foreach_mul_(exp_avgs, beta1)
+            torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+
+            torch._foreach_mul_(exp_avg_sqs, beta2)
+            torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+
+            if bias_correction:
+                bias_correction1 = [1 - beta1 ** step for step in state_steps]
+                bias_correction2 = [1 - beta2 ** step for step in state_steps]
+                # Compute step sizes
+                step_sizes = [lr / bc1 for bc1 in bias_correction1]
+            else:
+                step_sizes = [lr] * len(state_steps)
+
+            # Compute the denominator
+            denom = [exp_avg_sq.sqrt().add_(eps) for exp_avg_sq in exp_avg_sqs]
+
+            # Compute the step
+            steps = [(-step_size * (exp_avg / d)) for step_size, exp_avg, d in zip(step_sizes, exp_avgs, denom)]
+
+            # Apply filters and update parameters
+            for (param, filter_tensor), step in zip(filtered_params, steps):
+                param.data.add_(step * filter_tensor)
 
         return loss
+
     
     # Load state_dict from PyTorch Adam
     def load_state_dict(self, state_dict, filters=None):
@@ -86,3 +114,7 @@ class ElementWiseAdam(Optimizer):
         if filters is not None:
             for group in self.param_groups:
                 group['filters'] = filters
+
+        for group in self.param_groups:
+            if 'bias_correction' not in group:
+                group['bias_correction'] = self.defaults.get('bias_correction', True)
